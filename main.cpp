@@ -6,7 +6,6 @@
 #include <thread>
 #include <mutex>
 #include <unistd.h>
-#include <atomic>
 
 using namespace std;
 
@@ -36,8 +35,8 @@ struct MyCompare {
 
 vector<char> code;
 map<char, vector<char>> dictionary;
-mutex mtx;
 bool isLoading = false;
+pthread_mutex_t readMutex;
 map<char, int> symbolsTable;
 
 void animation() {
@@ -136,7 +135,6 @@ void writeEncodedToFile(ifstream &inputFile, string outputFilePath) {
     fileToOutput.close();
 }
 
-
 void writeEncodedToFileLog(ifstream &inputFile, string outputFilePath) {
     auto start = chrono::high_resolution_clock::now();
     cout << "Writing encoded to file: ";
@@ -175,20 +173,6 @@ Node *buildTreeLog(list<Node *> treeNodes) {
     return root;
 }
 
-void countSymbols(const string &chunk) {
-    map<char, int> localTable;
-
-    for (char current: chunk) {
-        localTable[current]++;
-    }
-
-    for (const auto &entry: localTable) {
-        mtx.lock();
-        symbolsTable[entry.first] += entry.second;
-        mtx.unlock();
-    }
-}
-
 list<Node *> createTreeNodes() {
     list<Node *> treeNodes;
     for (auto &itr: symbolsTable) {
@@ -200,30 +184,54 @@ list<Node *> createTreeNodes() {
     return treeNodes;
 }
 
+// Function to be executed by each thread
+void *countSymbols(void *arg) {
+    string &chunk = *static_cast<string *>(arg);
+    map<char, int> localTable;
+
+    for (char current: chunk) {
+        localTable[current]++;
+    }
+
+    // Use mutex to protect the shared symbolsTable
+    for (const auto &entry: localTable) {
+        pthread_mutex_lock(&readMutex);
+        symbolsTable[entry.first] += entry.second;
+        pthread_mutex_unlock(&readMutex);
+    }
+
+    return nullptr;
+}
+
 void readFromFile(ifstream &inputFile, const int numThreads) {
     inputFile.seekg(0, ios::end);
     streampos fileSize = inputFile.tellg();
     inputFile.seekg(0, ios::beg);
 
-    vector<thread> threads;
+    vector<pthread_t> threads;
+    vector<string> chunks(numThreads);
 
     // Read the file in chunks and process each chunk in a separate thread
     const streampos chunkSize = fileSize / numThreads;
     for (int i = 0; i < numThreads; ++i) {
-        string chunk(chunkSize, '\0');
-        inputFile.read(&chunk[0], chunkSize);
-        threads.emplace_back(countSymbols, chunk);
+        chunks[i].resize(chunkSize);
+        inputFile.read(&chunks[i][0], chunkSize);
+        pthread_t thread;
+        pthread_create(&thread, nullptr, countSymbols, &chunks[i]);
+        threads.push_back(thread);
     }
 
     // Wait for all threads to finish
-    for (auto &thread: threads) {
-        thread.join();
+    for (pthread_t &thread: threads) {
+        pthread_join(thread, nullptr);
     }
 
     // Process the remaining data (if any) in the main thread
     string remainingChunk(fileSize % numThreads, '\0');
-    inputFile.read(&remainingChunk[0], remainingChunk.size());
-    countSymbols(remainingChunk);
+    if (remainingChunk.size() != 0) {
+        inputFile.read(&remainingChunk[0], remainingChunk.size());
+        countSymbols(&remainingChunk[0]);
+    }
 }
 
 void readFromFileLog(ifstream &inputFile, const int numThreads) {
@@ -247,6 +255,8 @@ int main(int argc, char *argv[]) {
                 "<y if print result to stdout, no otherwise>\n";
         return 1;
     }
+    pthread_mutex_init(&readMutex, nullptr);
+
     const int numThreads = std::stoi(argv[1]);
     const string inputPath = argv[2];
     const string outputPath = argv[3];
